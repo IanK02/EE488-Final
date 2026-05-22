@@ -35,10 +35,13 @@ import meep as mp
 import meep.adjoint as mpa
 
 warnings.filterwarnings("ignore")
-mp.verbosity(0)   # set to 1 for full FDTD diagnostics
+mp.verbosity(1)   # set to 1 for full FDTD diagnostics
 
-print(f"MEEP  version : {mp.__version__}")
-print(f"NumPy version : {np.__version__}")
+if mp.am_master():
+    print(f"MEEP  version : {mp.__version__}")
+    print(f"NumPy version : {np.__version__}")
+
+START_TIME = datetime.now()
 
 
 # In[2]:
@@ -67,13 +70,13 @@ w_wg  = 0.50         # waveguide width — supports both TE₀ and TM₀
 t_BOX = 1.0          # SiO₂ BOX thickness
 
 # Design region
-dr_lx = 4.0          # design region length in x (µm)
-dr_ly = 2.5          # design region width in y (µm)
+dr_lx = 6.0          # design region length in x (µm)
+dr_ly = 3.0          # design region width in y (µm)
 
 
 # ===== RUN CONFIG =====
-RUN_NAME = "run1_stage1b"      # change this for each run
-RESTART_FROM = "misc/runs/run1_stage1/final_params.npy"  # e.g. "misc/runs/run1_stage1/final_params.npy"
+RUN_NAME = "run3A_stage1"      # change this for each run
+RESTART_FROM = None  # e.g. "misc/runs/run1_stage1/final_params.npy"
 
 RUN_DIR = f"misc/runs/{RUN_NAME}"
 os.makedirs(RUN_DIR, exist_ok=True)
@@ -83,25 +86,21 @@ final_params_fname = f"{RUN_DIR}/final_params.npy"
 final_design_csv = f"{RUN_DIR}/final_design.csv"
 
 # ===== QUALITY SETTINGS =====
-global_res = 16      # stage1: 16, stage2: 20, stage3: 25, polish: 30
+global_res = 16
 dr_res = global_res
 
-opt_steps = 100       # stage1: 15, stage2: 25, stage3: 30, polish: 10
-lambda_pen_max = 0.05 # stage1: 0.05, stage2: 0.15, stage3: 0.3, polish: 0.5
-unitary_pen_max = 0.05  # stage1: 0.05–0.1, stage2: 0.2, final: 0.5
+opt_steps = 100
+lambda_pen_max = 0.01
+unitary_pen_max = 0.01  # gradient is approximate: keep this low (~0.01)
 
 beta_min = 1.0
-beta_max = 16.0      # stage1: 12, stage2: 24, stage3: 48, polish: 64
-beta_ramp_start = int(opt_steps * 0.2)
+beta_max = 6.0      # 2-4 allows exploration, 6-10 is more binary, 12-24 to lock in binary values
+beta_ramp_start = int(opt_steps * 0.4)
 
 df = 0.05 * fcen     # stage1: 0.05, stage2: 0.035, stage3: 0.025, polish: 0.02
 
-
-# Calculate exact integer pixel counts and snap sizes to avoid MEEP warnings
-Nx = int(round(dr_lx * global_res))
-Ny = int(round(dr_ly * global_res))
-dr_lx = Nx / global_res   # re-snap to exact grid
-dr_ly = Ny / global_res
+skip_transmission_calibration = True
+# Other params
 
 # Waveguide stub length on each side of the design region (inside the cell)
 stub_len = 1.0
@@ -113,57 +112,100 @@ dpml = 1.0
 min_feature = 0.10   # 100 nm
 filter_R    = min_feature
 
-os.makedirs("misc", exist_ok=True)
-
-print(f"Design region : {dr_lx} µm × {dr_ly} µm")
-print(f"Grid          : {Nx} × {Ny} = {Nx*Ny:,} parameters")
-print(f"Resolution    : {global_res} px/µm  (Si slab = {t_Si*global_res:.1f} cells thick)")
-
 
 # In[3]:
 
-
 # Section 3 — Derived geometry quantities with strict pixel snapping
 
-Npar = Nx * Ny
+# ------------------------------------------------------------
+# Grid snapping helpers
+# ------------------------------------------------------------
+def snap_len(x, res=global_res):
+    """
+    Snap a physical length in µm to an integer number of grid pixels.
+    """
+    return round(x * res) / res
 
-# Force the entire cell dimensions to snap perfectly to integer pixel counts
-sx_raw = dr_lx + 2*stub_len + 2*dpml
-sy_raw = dr_ly  + 2*dpml
-sz_raw = t_Si   + t_BOX + 2*dpml
 
-cell_nx = int(round(sx_raw * global_res))
-cell_ny = int(round(sy_raw * global_res))
-cell_nz = int(round(sz_raw * global_res))
+def snap_pix(x, res=global_res):
+    """
+    Return integer pixel count for a physical length.
+    """
+    return int(round(x * res))
 
-sx = cell_nx / global_res
-sy = cell_ny / global_res
-sz = cell_nz / global_res
+
+def snap_coord(x, res=global_res):
+    """
+    Snap a coordinate to the simulation grid.
+    Useful for source/monitor centers.
+    """
+    return round(x * res) / res
+
+# ------------------------------------------------------------
+# Grid-snapped physical dimensions
+# ------------------------------------------------------------
+
+# Design region pixel counts
+Nx = snap_pix(dr_lx, global_res)
+Ny = snap_pix(dr_ly, global_res)
+
+# Snap design-region dimensions
+dr_lx = Nx / global_res
+dr_ly = Ny / global_res
+
+# Snap layer thicknesses used in geometry/volumes
+# Note: this slightly changes the simulated thickness to the nearest grid value.
+t_Si_sim  = snap_len(t_Si, global_res)
+t_BOX_sim = snap_len(t_BOX, global_res)
+
+# Use snapped layer thicknesses for geometry placement
+z_si_top  =  t_Si_sim / 2
+z_si_bot  = -t_Si_sim / 2
+z_box_bot = z_si_bot - t_BOX_sim
+
+# Stub / PML dimensions
+stub_len = snap_len(stub_len, global_res)
+dpml     = snap_len(dpml, global_res)
+
+# Full cell dimensions
+sx = snap_len(dr_lx + 2 * stub_len + 2 * dpml, global_res)
+sy = snap_len(dr_ly + 2 * dpml, global_res)
+sz = snap_len(t_Si_sim + t_BOX_sim + 2 * dpml, global_res)
 
 cell = mp.Vector3(sx, sy, sz)
 
-# z-coordinates (MEEP cell centred at z = 0, aligned to mid-Si-slab)
-z_si_top  =  t_Si / 2
-z_si_bot  = -t_Si / 2
-z_box_bot = z_si_bot - t_BOX
+# Source / monitor x positions
+src_x = snap_coord(-(dr_lx / 2 + stub_len / 2), global_res)
+mon_x = snap_coord( (dr_lx / 2 + stub_len / 2), global_res)
 
-# Source / monitor x-positions (centred in stub, clear of PML)
-src_x = -(dr_lx/2 + stub_len/2)
-mon_x =  (dr_lx/2 + stub_len/2)
-
-# Monitor cross-section (y × z) — large enough to capture both guided modes
+# Monitor cross-section
 mon_y = dr_ly
-mon_z = t_Si + t_BOX + 0.4   # a bit of air on top too
+mon_z = snap_len(t_Si_sim + t_BOX_sim + 0.4, global_res)
 
 # Interface-buffer dimensions in design-grid pixels
 n_border_x  = max(2, int(round(0.16 * dr_res)))
 n_wg_half_y = max(1, int(round((w_wg / 2) * dr_res)))
 n_cy        = Ny // 2
 
-print(f"Design grid : {Nx} × {Ny} = {Npar:,} parameters")
-print(f"Cell size : {sx:.2f} × {sy:.2f} × {sz:.2f} µm")
-print(f"src_x = {src_x:.3f} µm,  mon_x = {mon_x:.3f} µm")
-print(f"Buffer: {n_border_x} px in x | WG half-width: {n_wg_half_y} px in y")
+Npar = Nx * Ny
+
+if mp.am_master():
+    os.makedirs("misc", exist_ok=True)
+    
+    print(f"Design region : {dr_lx} µm × {dr_ly} µm")
+    print(f"Grid          : {Nx} × {Ny} = {Nx*Ny:,} parameters")
+    print(f"Resolution    : {global_res} px/µm  (Si slab = {t_Si*global_res:.1f} cells thick)")
+    print(f"Physical t_Si requested : {t_Si:.4f} µm")
+    print(f"Grid-snapped t_Si used  : {t_Si_sim:.4f} µm")
+    print(f"Physical BOX requested  : {t_BOX:.4f} µm")
+    print(f"Grid-snapped BOX used   : {t_BOX_sim:.4f} µm")
+    print(f"Design region           : {dr_lx:.4f} µm × {dr_ly:.4f} µm")
+    print(f"Grid                    : {Nx} × {Ny} = {Npar:,} parameters")
+    print(f"Cell size               : {sx:.4f} × {sy:.4f} × {sz:.4f} µm")
+    print(f"src_x = {src_x:.4f} µm, mon_x = {mon_x:.4f} µm")
+
+
+
 
 
 # In[4]:
@@ -203,7 +245,8 @@ def static_geometry():
 
     return [box_layer, wg_in, wg_out]
 
-print("static_geometry() defined — SiO₂ BOX + WG-in + WG-out")
+if mp.am_master():
+    print("static_geometry() defined — SiO₂ BOX + WG-in + WG-out")
 
 
 # In[5]:
@@ -279,8 +322,9 @@ def pre_process_grad(params_flat, grad_rho_flat, beta):
     g[Nx-n_border_x:Nx, y0:y1]     = 0.0
     return g.ravel()
 
-print(f"Conic kernel: {_conic_k.shape[0]}×{_conic_k.shape[1]} px  "
-      f"(radius={filter_R} µm at {dr_res} px/µm)")
+if mp.am_master():
+    print(f"Conic kernel: {_conic_k.shape[0]}×{_conic_k.shape[1]} px  "
+        f"(radius={filter_R} µm at {dr_res} px/µm)")
 
 
 # In[6]:
@@ -301,8 +345,64 @@ def fab_penalty(params_flat, beta, beta_ed=8.0):
     rho_dil = tanh_proj(conic_filter(rho), beta_ed)
     return float(np.mean(rho_ero * (1.0 - rho_dil)))
 
-print("fab_penalty() defined.")
 
+def conic_filter_T(g):
+    """
+    Adjoint of conic_filter.
+    Since the kernel is symmetric, this is the same convolution.
+    """
+    return ssg.convolve2d(g, _conic_k, mode="same", boundary="fill", fillvalue=0.0)
+
+
+def fab_penalty_and_grad(params_flat, beta, beta_ed=8.0):
+    """
+    Returns fabrication penalty and approximate analytical gradient
+    with respect to raw params_flat.
+    """
+
+    rho = pre_process(params_flat, beta).reshape(Nx, Ny)
+
+    # Erosion branch
+    q = 1.0 - rho
+    fq = conic_filter(q)
+    pq = tanh_proj(fq, beta_ed)
+    rho_ero = 1.0 - pq
+
+    # Dilation branch
+    fr = conic_filter(rho)
+    rho_dil = tanh_proj(fr, beta_ed)
+
+    penalty = np.mean(rho_ero * (1.0 - rho_dil))
+
+    scale = 1.0 / (Nx * Ny)
+
+    # d penalty / d rho_ero
+    g_ero = scale * (1.0 - rho_dil)
+
+    # d penalty / d rho_dil
+    g_dil = scale * (-rho_ero)
+
+    # Backprop erosion:
+    # rho_ero = 1 - tanh_proj(conic_filter(1-rho))
+    g_pq = -g_ero
+    g_fq = g_pq * dtanh_proj(fq, beta_ed)
+    g_q = conic_filter_T(g_fq)
+    g_rho_from_ero = -g_q
+
+    # Backprop dilation:
+    # rho_dil = tanh_proj(conic_filter(rho))
+    g_fr = g_dil * dtanh_proj(fr, beta_ed)
+    g_rho_from_dil = conic_filter_T(g_fr)
+
+    g_rho = g_rho_from_ero + g_rho_from_dil
+
+    # Backprop through main preprocessing pipeline
+    g_params = pre_process_grad(params_flat, g_rho.ravel(), beta)
+
+    return float(penalty), g_params
+
+if mp.am_master():
+    print("Penalty functions defined.")
 
 # In[7]:
 
@@ -368,15 +468,20 @@ def calibrate_modes():
         te_frac = Ey2 / (Ey2 + Ez2 + 1e-30)
         neff    = em.kdom.x / fcen
         results[band] = (te_frac, neff)
-        print(f"  band {band}: neff={neff:.4f}  |Ey|² frac={te_frac:.3f}")
+
+        if mp.am_master():
+            print(f"  band {band}: neff={neff:.4f}  |Ey|² frac={te_frac:.3f}")
 
     # Assign TE to the band with larger |Ey|² fraction
     eig_band_TE = 1 if results[1][0] >= results[2][0] else 2
     eig_band_TM = 3 - eig_band_TE
-    print(f"\n  → eig_band_TE={eig_band_TE},  eig_band_TM={eig_band_TM}")
+
+    if mp.am_master():
+        print(f"\n  → eig_band_TE={eig_band_TE},  eig_band_TM={eig_band_TM}")
     return eig_band_TE, eig_band_TM
 
-print("Running mode calibration…")
+if mp.am_master():
+    print("Running mode calibration…")
 eig_band_TE, eig_band_TM = calibrate_modes()
 
 
@@ -410,9 +515,17 @@ def is_unitary(U, tol=1e-9):
 U_target = hadamard()
 
 assert is_unitary(U_target), "U_target is not unitary!"
-print("U_target (Hadamard) =")
-print(np.round(U_target, 4))
+if mp.am_master():
+    print("U_target (Hadamard) =")
+    print(np.round(U_target, 4))
 
+# ------------------------------------------------------------
+# Reference normalization for physical transmission metric
+# ------------------------------------------------------------
+REF_NORM = {
+    "TE": None,
+    "TM": None,
+}
 
 # In[9]:
 
@@ -448,19 +561,41 @@ print(np.round(U_target, 4))
 # The gradient returned by opt() is exactly dJ_col / d(rho), so summing
 # grad_TE + grad_TM gives dF/d(rho) up to the 1/4 normalization.
 
-def _make_opt(source_band, target_col):
-    """
-    Build a persistent mpa.OptimizationProblem for one input polarization.
+# ------------------------------------------------------------
+# Dynamic objective controls
+# ------------------------------------------------------------
+DYN_OBJ = {
+    "TE": {
+        "target": np.array([1.0, 0.0], dtype=complex),
+        "orth":   np.array([0.0, 1.0], dtype=complex),
+        "orth_weight": 0.0,
+    },
+    "TM": {
+        "target": np.array([0.0, 1.0], dtype=complex),
+        "orth":   np.array([1.0, 0.0], dtype=complex),
+        "orth_weight": 0.0,
+    },
+}
 
-    Parameters
-    ----------
-    source_band : int
-        EigenModeSource band index (1 = TE, 2 = TM or whichever calibration returned).
-    target_col : np.ndarray, shape (2,), complex
-        The corresponding column of U_target; used as a fixed coefficient vector
-        inside the autograd objective so the gradient flows only through the
-        FDTD amplitudes.
+# Previous normalized output columns, used for lagged unitarity gradient
+PREV_COLS = {
+    "TE": None,
+    "TM": None,
+}
+
+
+def _make_opt(source_band, input_key):
     """
+    Build a persistent OptimizationProblem for one input polarization.
+
+    This objective supports:
+      1. Positive overlap with the desired Hadamard target column.
+      2. Negative overlap with a lagged opposite output column.
+
+    This gives an approximate unitary/orthogonality gradient using only
+    two MEEP adjoint solves per optimization iteration.
+    """
+
     dummy_rho = np.full(Npar, 0.5)
 
     design_vars = mp.MaterialGrid(
@@ -472,9 +607,9 @@ def _make_opt(source_band, target_col):
     )
 
     design_block = mp.Block(
-        size     = mp.Vector3(dr_lx, dr_ly, t_Si),
-        center   = mp.Vector3(0, 0, 0),
-        material = design_vars,
+        size=mp.Vector3(dr_lx, dr_ly, t_Si),
+        center=mp.Vector3(0, 0, 0),
+        material=design_vars,
     )
 
     geom = static_geometry() + [design_block]
@@ -498,12 +633,12 @@ def _make_opt(source_band, target_col):
     )
 
     sim = mp.Simulation(
-        cell_size       = cell,
-        boundary_layers = [mp.PML(dpml)],
-        geometry        = geom,
-        sources         = [src],
-        resolution      = global_res,
-        eps_averaging   = False,
+        cell_size=cell,
+        boundary_layers=[mp.PML(dpml)],
+        geometry=geom,
+        sources=[src],
+        resolution=global_res,
+        eps_averaging=False,
     )
 
     mon_vol = mp.Volume(
@@ -513,40 +648,53 @@ def _make_opt(source_band, target_col):
 
     te_mon = mpa.EigenmodeCoefficient(
         sim, mon_vol, mode=eig_band_TE,
-        eig_parity=mp.NO_PARITY, forward=True,
+        eig_parity=mp.NO_PARITY,
+        forward=True,
     )
+
     tm_mon = mpa.EigenmodeCoefficient(
         sim, mon_vol, mode=eig_band_TM,
-        eig_parity=mp.NO_PARITY, forward=True,
+        eig_parity=mp.NO_PARITY,
+        forward=True,
     )
 
-    # Fix target_col as a Python-level constant (not a MEEP design variable)
-    # so autograd only differentiates through a_te[0] and a_tm[0].
-    c0 = complex(target_col[0])
-    c1 = complex(target_col[1])
-
     def objective(a_te, a_tm):
-        # a_te and a_tm each have shape (n_freqs,); index [0] for the single freq.
-        overlap = anp.conj(c0) * a_te[0] + anp.conj(c1) * a_tm[0]
-        return anp.abs(overlap) ** 2
+        obj = DYN_OBJ[input_key]
+
+        target = obj["target"]
+        orth = obj["orth"]
+        orth_weight = obj["orth_weight"]
+
+        # Desired Hadamard-column overlap
+        good_overlap = anp.conj(target[0]) * a_te[0] + anp.conj(target[1]) * a_tm[0]
+        good_term = anp.abs(good_overlap) ** 2
+
+        # Lagged orthogonality penalty
+        bad_overlap = anp.conj(orth[0]) * a_te[0] + anp.conj(orth[1]) * a_tm[0]
+        bad_term = anp.abs(bad_overlap) ** 2
+
+        return good_term - orth_weight * bad_term
 
     opt = mpa.OptimizationProblem(
-        simulation          = sim,
-        objective_functions = [objective],
-        objective_arguments = [te_mon, tm_mon],
-        design_regions      = [dr],
-        frequencies         = [fcen],
+        simulation=sim,
+        objective_functions=[objective],
+        objective_arguments=[te_mon, tm_mon],
+        design_regions=[dr],
+        frequencies=[fcen],
     )
 
     return opt
 
-print("Building TE optimization problem...")
-opt_TE = _make_opt(eig_band_TE, U_target[:, 0])
+if mp.am_master():
+    print("Building TE optimization problem...")
+opt_TE = _make_opt(eig_band_TE, "TE")
 
-print("Building TM optimization problem...")
-opt_TM = _make_opt(eig_band_TM, U_target[:, 1])
+if mp.am_master():
+    print("Building TM optimization problem...")
+opt_TM = _make_opt(eig_band_TM, "TM")
 
-print("OptimizationProblem objects created.")
+if mp.am_master():
+    print("OptimizationProblem objects created.")
 
 
 # In[10]:
@@ -578,8 +726,55 @@ def _get_raw_amplitudes(opt_obj, rho):
 
     return float(np.real(f_val)), grad_arr, a_te, a_tm
 
-print("_get_raw_amplitudes() helper defined.")
+def calibrate_transmission_reference(beta=1.0):
+    """
+    Calibrate raw EigenmodeCoefficient amplitudes to a straight-ish reference.
 
+    This gives reference amplitudes for:
+      - TE input -> TE output
+      - TM input -> TM output
+
+    After this, U_phys[:, 0] = U_raw[:, 0] / REF_NORM["TE"]
+                U_phys[:, 1] = U_raw[:, 1] / REF_NORM["TM"]
+
+    Note:
+    This uses a fully filled silicon design region as the reference.
+    That creates a continuous straight waveguide/slab through the device region.
+    """
+
+    global REF_NORM
+
+    if mp.am_master():
+        print("=" * 60)
+        print("CALIBRATING TRANSMISSION REFERENCE")
+        print("=" * 60)
+
+    # Fully silicon design region after preprocessing/interface buffer
+    ref_params = np.ones(Npar)
+    rho_ref = pre_process(ref_params, beta)
+
+    # TE input reference
+    _, _, a_te_TE_ref, a_tm_TE_ref = _get_raw_amplitudes(opt_TE, rho_ref)
+
+    # TM input reference
+    _, _, a_te_TM_ref, a_tm_TM_ref = _get_raw_amplitudes(opt_TM, rho_ref)
+
+    # Use same-polarization through coefficients as input normalization
+    REF_NORM["TE"] = a_te_TE_ref
+    REF_NORM["TM"] = a_tm_TM_ref
+
+    if mp.am_master():
+        print(f"TE reference amplitude: {REF_NORM['TE']}")
+        print(f"TM reference amplitude: {REF_NORM['TM']}")
+        print("Reference cross terms:")
+        print(f"  TE input -> TM output: {a_tm_TE_ref}")
+        print(f"  TM input -> TE output: {a_te_TM_ref}")
+        print("=" * 60)
+
+    return REF_NORM
+
+if mp.am_master():
+    print("_get_raw_amplitudes() and calibrate_transmission_reference() defined.")
 
 # In[11]:
 
@@ -605,8 +800,9 @@ ax1.hist(rho_init.ravel(), bins=50, color="steelblue", edgecolor="none")
 ax1.set_xlabel("Density ρ"); ax1.set_ylabel("Count"); ax1.set_title("Initial density histogram")
 
 if mp.am_master():
-    plt.show()
-print(f"Npar = {Npar:,}  |  init_par ∈ [{init_par.min():.3f}, {init_par.max():.3f}]")
+    plt.savefig(f"{RUN_DIR}/initial_design.png", dpi=200)
+    plt.close()
+    print(f"Npar = {Npar:,}  |  init_par ∈ [{init_par.min():.3f}, {init_par.max():.3f}]")
 
 
 # In[12]:
@@ -644,7 +840,9 @@ try:
     history = load_history()
     params = history["params"][-1].copy()
     num_done = len(history["J"])
-    print(f"Loaded checkpoint: {num_done}/{opt_steps} iterations done from {history_fname}")
+
+    if mp.am_master():
+        print(f"Loaded checkpoint: {num_done}/{opt_steps} iterations done from {history_fname}")
 
 except FileNotFoundError:
     if RESTART_FROM is not None:
@@ -664,8 +862,9 @@ except FileNotFoundError:
             Fh=[], Tavg=[], Uerr=[], Penalty=[]
         )
 
-        print(f"Restarting from saved design: {RESTART_FROM}")
-        print(f"Old shape: {old_shape}, new shape: {(Nx, Ny)}")
+        if mp.am_master():
+            print(f"Restarting from saved design: {RESTART_FROM}")
+            print(f"Old shape: {old_shape}, new shape: {(Nx, Ny)}")
 
     else:
         params = init_par.copy()
@@ -673,7 +872,8 @@ except FileNotFoundError:
             J=[], params=[], grad=[], beta=[], U_meas=[],
             Fh=[], Tavg=[], Uerr=[], Penalty=[]
         )
-        print("No checkpoint found — starting fresh.")
+        if mp.am_master():
+            print("No checkpoint found — starting fresh.")
 
 
 # In[13]:
@@ -700,90 +900,157 @@ except FileNotFoundError:
 
 def evaluate_and_grad(params_flat, beta, lambda_pen_val, unitary_pen_val, step_num=None):
     """
-    Run two FDTD sims (TE input, TM input) and return (J, grad, info_dict).
+    2-simulation-per-iteration version with approximate lagged unitary gradient.
 
-    Parameters
-    ----------
-    params_flat    : np.ndarray, shape (Npar,), values in [0, 1]
-    beta           : float, projection sharpness
-    lambda_pen_val : float, fabrication penalty weight
-    step_num       : int or str, optional, for logging
+    Cost:
+      - TE input adjoint solve
+      - TM input adjoint solve
 
-    Returns
-    -------
-    J     : float, objective to maximise
-    grad  : np.ndarray, shape (Npar,), dJ/d(params_flat)
-    info  : dict with diagnostic scalars and U_meas
+    Includes:
+      - Hadamard column fidelity gradient
+      - fabrication penalty gradient
+      - approximate unitary/orthogonality gradient using previous iteration columns
     """
-    # ── 1. Preprocess design variables ──────────────────────────────────────
+
     rho = pre_process(params_flat, beta)
 
-    # ── 2. TE-input simulation ───────────────────────────────────────────────
-    f_te_raw, grad_te, a_te_TE, a_tm_TE = _get_raw_amplitudes(opt_TE, rho)
+    # ------------------------------------------------------------
+    # 1. Configure dynamic objectives
+    # ------------------------------------------------------------
 
-    # Per-column normalization: scale so the output column is a unit vector.
-    norm_TE = np.sqrt(abs(a_te_TE)**2 + abs(a_tm_TE)**2 + 1e-30)
-    a_te_TE /= norm_TE
-    a_tm_TE /= norm_TE
+    # Desired Hadamard columns
+    DYN_OBJ["TE"]["target"] = U_target[:, 0]
+    DYN_OBJ["TM"]["target"] = U_target[:, 1]
 
-    # ── 3. TM-input simulation ───────────────────────────────────────────────
-    f_tm_raw, grad_tm, a_te_TM, a_tm_TM = _get_raw_amplitudes(opt_TM, rho)
+    # Use previous opposite columns for lightweight unitary gradient
+    if PREV_COLS["TM"] is not None and PREV_COLS["TE"] is not None:
+        DYN_OBJ["TE"]["orth"] = PREV_COLS["TM"]
+        DYN_OBJ["TM"]["orth"] = PREV_COLS["TE"]
 
-    norm_TM = np.sqrt(abs(a_te_TM)**2 + abs(a_tm_TM)**2 + 1e-30)
-    a_te_TM /= norm_TM
-    a_tm_TM /= norm_TM
+        # This is the approximate unitary-gradient strength.
+        # Keep it modest because it is lagged/stale.
+        DYN_OBJ["TE"]["orth_weight"] = unitary_pen_val
+        DYN_OBJ["TM"]["orth_weight"] = unitary_pen_val
+    else:
+        # First iteration has no previous columns yet
+        DYN_OBJ["TE"]["orth"] = U_target[:, 1]
+        DYN_OBJ["TM"]["orth"] = U_target[:, 0]
+        DYN_OBJ["TE"]["orth_weight"] = 0.0
+        DYN_OBJ["TM"]["orth_weight"] = 0.0
 
-    # ── 4. Construct measured unitary matrix ─────────────────────────────────
-    # U_meas[row, col]: row = output mode (TE=0, TM=1), col = input (TE=0, TM=1)
-    U_meas = np.array([
-        [a_te_TE, a_te_TM],
-        [a_tm_TE, a_tm_TM],
+    # ------------------------------------------------------------
+    # 2. TE and TM simulations
+    # ------------------------------------------------------------
+    f_te_obj, grad_te_obj, a_te_TE_raw, a_tm_TE_raw = _get_raw_amplitudes(opt_TE, rho)
+    f_tm_obj, grad_tm_obj, a_te_TM_raw, a_tm_TM_raw = _get_raw_amplitudes(opt_TM, rho)
+
+    # ------------------------------------------------------------
+    # 3. Build raw measured matrix
+    # ------------------------------------------------------------
+    U_raw = np.array([
+        [a_te_TE_raw, a_te_TM_raw],
+        [a_tm_TE_raw, a_tm_TM_raw],
     ], dtype=complex)
 
-    # ── 5. Objective: |Tr(U_target† U_meas)|² / 4 ───────────────────────────
-    # Gauge-invariant fidelity F ∈ [0, 1]; peak = 1 when U_meas = e^{iφ} U_target.
-    inner    = np.trace(U_target.conj().T @ U_meas)
-    fidelity = float(np.abs(inner)**2 / 4.0)
+    # ------------------------------------------------------------
+    # Calibrated physical-ish guided-mode transmission
+    # ------------------------------------------------------------
+    if REF_NORM["TE"] is not None and REF_NORM["TM"] is not None:
+        U_phys = np.array([
+            [U_raw[0, 0] / REF_NORM["TE"], U_raw[0, 1] / REF_NORM["TM"]],
+            [U_raw[1, 0] / REF_NORM["TE"], U_raw[1, 1] / REF_NORM["TM"]],
+        ], dtype=complex)
 
-    # Transmission and unitarity diagnostics (on normalized U_meas)
-    Tavg = float(np.linalg.norm(U_meas, 'fro')**2 / 2.0)
-    Uerr = float(np.linalg.norm(U_meas.conj().T @ U_meas - np.eye(2), 'fro'))
+        Tphys = float(np.linalg.norm(U_phys, "fro")**2 / 2.0)
+    else:
+        U_phys = U_raw.copy()
+        Tphys = float(np.linalg.norm(U_raw, "fro")**2 / 2.0)
 
-    # ── 6. Fabrication and Unitary penalty ───────────────────────────────────────────────
+    # ------------------------------------------------------------
+    # 4. Normalize columns for gate-shape metrics
+    # ------------------------------------------------------------
+    norm_TE = np.sqrt(abs(a_te_TE_raw)**2 + abs(a_tm_TE_raw)**2 + 1e-30)
+    norm_TM = np.sqrt(abs(a_te_TM_raw)**2 + abs(a_tm_TM_raw)**2 + 1e-30)
+
+    u_TE = np.array([a_te_TE_raw, a_tm_TE_raw], dtype=complex) / norm_TE
+    u_TM = np.array([a_te_TM_raw, a_tm_TM_raw], dtype=complex) / norm_TM
+
+    U_meas = np.array([
+        [u_TE[0], u_TM[0]],
+        [u_TE[1], u_TM[1]],
+    ], dtype=complex)
+
+    # Save columns for next iteration's lagged unitary gradient
+    PREV_COLS["TE"] = u_TE.copy()
+    PREV_COLS["TM"] = u_TM.copy()
+
+    # ------------------------------------------------------------
+    # 5. Diagnostics
+    # ------------------------------------------------------------
+    col0 = abs(np.vdot(U_target[:, 0], u_TE))**2
+    col1 = abs(np.vdot(U_target[:, 1], u_TM))**2
+    fidelity = float(0.5 * (col0 + col1))
+
+    Uerr = float(np.linalg.norm(U_meas.conj().T @ U_meas - np.eye(2), "fro"))
     unitary_pen = Uerr**2
-    pen = fab_penalty(params_flat, beta)
 
-    # ── 7. Combined objective ────────────────────────────────────────────────
+    # ------------------------------------------------------------
+    # 6. Fabrication penalty and gradient
+    # ------------------------------------------------------------
+    pen, grad_fab_params = fab_penalty_and_grad(params_flat, beta)
+
+    # ------------------------------------------------------------
+    # 7. Optical gradient from the two dynamic objectives
+    #
+    # grad_te_obj and grad_tm_obj already include:
+    #   + Hadamard target gradient
+    #   - lagged orthogonality gradient
+    # because that was built into the MEEP objective.
+    # ------------------------------------------------------------
+    dJopt_drho = 0.5 * (
+        grad_te_obj.ravel() / (norm_TE**2)
+        + grad_tm_obj.ravel() / (norm_TM**2)
+    )
+
+    grad_optical_params = pre_process_grad(params_flat, dJopt_drho, beta)
+
+    # ------------------------------------------------------------
+    # 8. Final objective and gradient
+    # ------------------------------------------------------------
     J = fidelity - lambda_pen_val * pen - unitary_pen_val * unitary_pen
 
-    # ── 8. Gradient ──────────────────────────────────────────────────────────
-    # Raw adjoint gradient for each column is d(J_col_raw)/d(rho).
-    # After per-column normalization the effective gradient scales by 1/norm².
-    # Sum the two column contributions and divide by 4 (the |Tr|²/4 factor).
-    dF_drho = (grad_te / norm_TE**2 + grad_tm / norm_TM**2) / 4.0
+    grad = grad_optical_params - lambda_pen_val * grad_fab_params
 
-    # Chain-rule through the preprocessing pipeline
-    grad = pre_process_grad(params_flat, dF_drho.ravel(), beta)
-
-    # ── 9. Logging ───────────────────────────────────────────────────────────
+    # ------------------------------------------------------------
+    # 9. Logging
+    # ------------------------------------------------------------
     tag = f"step {step_num}" if step_num is not None else "eval"
     np.set_printoptions(precision=3, suppress=True)
-    print(f"[{tag}] J={J:.4f} | F={fidelity:.4f} | Tavg={Tavg:.4f} | "
-          f"Uerr={Uerr:.4f} | Penalty={pen:.4f} | beta={beta:.1f}")
-    print(f"  U_meas =\n{U_meas}")
+
+    if mp.am_master():
+        print(
+            f"[{tag}] J={J:.4f} | F={fidelity:.4f} | "
+            f"Tphys={Tphys:.4f} | Uerr={Uerr:.4f} | orth_w={unitary_pen_val * unitary_pen:.4f} | "
+            f"Penalty={pen:.4f} | penalty_w={lambda_pen_val * pen:.4f} | beta={beta:.1f}"
+        )
+        print(f"  U_raw =\n{U_raw}")
+        print(f"  U_norm =\n{U_meas}")
 
     info = {
-        "J":       float(np.real(J)),
-        "Fh":      fidelity,
-        "Tavg":    Tavg,
-        "Uerr":    Uerr,
+        "J": float(np.real(J)),
+        "Fh": fidelity,
+        "Tavg": Tphys,
+        "Uerr": Uerr,
         "Penalty": pen,
-        "U":       U_meas.copy(),
+        "U": U_meas.copy(),
+        "U_raw": U_raw.copy(),
+        "U_phys": U_phys.copy(),
     }
 
-    return J, grad, info
+    return float(np.real(J)), grad, info
 
-print("evaluate_and_grad() defined.")
+if mp.am_master():
+    print("evaluate_and_grad() defined.")
 
 
 # In[ ]:
@@ -799,7 +1066,8 @@ iteration_counter = [len(history["J"])]
 
 def nlopt_callback(x, grad):
     i = iteration_counter[0]
-    print(f"\n\n{'='*55}\nIteration {i+1}/{opt_steps} - Time is {datetime.now()}.")
+    if mp.am_master():
+        print(f"\n\n{'='*55}\nIteration {i+1}/{opt_steps} - Time is {datetime.now()}.")
 
     # Beta schedule: hold at beta_min for first beta_ramp_start iters, then ramp
     if i < beta_ramp_start:
@@ -856,6 +1124,13 @@ def nlopt_callback(x, grad):
     iteration_counter[0] += 1
     return float(J_val)
 
+# Calibrate TE and TM
+if not skip_transmission_calibration:
+    if mp.am_master():
+        print(f"Starting TE, TM transmission calibration…")
+    calibrate_transmission_reference(beta=beta_min)
+    if mp.am_master():
+        print(f"Transmission Calibration Complete.")
 
 # Configure and launch NLopt
 remaining = opt_steps - len(history["J"])
@@ -867,10 +1142,12 @@ if remaining > 0:
     opt_nlopt.set_maxeval(remaining)
     opt_nlopt.set_ftol_rel(1e-6)
 
-    print(f"Starting NLopt MMA from iteration {len(history['J'])+1}…")
+    if mp.am_master():
+        print(f"Starting NLopt MMA from iteration {len(history['J'])+1}…")
     params = opt_nlopt.optimize(params.copy())
-    print(f"\nOptimisation finished.  Final J = {opt_nlopt.last_optimum_value():.4f}")
-else:
+    if mp.am_master():
+        print(f"\nOptimisation finished.  Final J = {opt_nlopt.last_optimum_value():.4f}")
+elif mp.am_master():
     print("Optimisation complete (loaded from checkpoint).")
 
 
@@ -909,7 +1186,8 @@ axes[2].set_title(f"Final design (β={final_beta:.1f})")
 axes[2].set_xlabel("x (µm)"); axes[2].set_ylabel("y (µm)")
 
 if mp.am_master():
-    plt.show()
+    plt.savefig(f"{RUN_DIR}/convergence_plot.png", dpi=200)
+    plt.close()
 
 
 # In[ ]:
@@ -920,14 +1198,16 @@ if mp.am_master():
 # Run two forward sims at beta=100 (≈ step function) with lambda_pen=0
 # to extract the purely optical performance metrics.
 
-print("="*60)
-print("RUNNING FINAL BINARIZED VERIFICATION")
-print("="*60)
+if mp.am_master():
+    print("="*60)
+    print("RUNNING FINAL BINARIZED VERIFICATION")
+    print("="*60)
 
 _, _, verify_info = evaluate_and_grad(
     params_flat    = final_par,
     beta           = 100.0,
     lambda_pen_val = 0.0,
+    unitary_pen_val = 0.0,
     step_num       = "VERIFY",
 )
 
@@ -936,20 +1216,21 @@ fidelity_final   = verify_info["Fh"]
 transmission_final = verify_info["Tavg"]
 unitarity_residual = float(np.linalg.norm(U_final.conj().T @ U_final - np.eye(2), "fro"))
 
-print("\n" + "="*60)
-print("FINAL DEVICE PERFORMANCE")
-print("="*60)
-print("U_target =")
-print(np.round(U_target, 4))
-print("\nU_meas (binarised) =")
-print(np.round(U_final, 4))
-print("\n|U_target − U_meas| (elementwise) =")
-print(np.round(np.abs(U_target - U_final), 4))
-print("-"*60)
-print(f"Fidelity  F = |Tr(U†U_meas)|²/4  = {fidelity_final:.4f}   (ideal = 1.0)")
-print(f"Transmission T = ‖U‖²_F / 2      = {transmission_final:.4f}  (lossless = 1.0)")
-print(f"Unitarity residual ‖U†U − I‖_F   = {unitarity_residual:.4f}  (ideal = 0.0)")
-print("="*60)
+if mp.am_master():
+    print("\n" + "="*60)
+    print("FINAL DEVICE PERFORMANCE")
+    print("="*60)
+    print("U_target =")
+    print(np.round(U_target, 4))
+    print("\nU_meas (binarised) =")
+    print(np.round(U_final, 4))
+    print("\n|U_target − U_meas| (elementwise) =")
+    print(np.round(np.abs(U_target - U_final), 4))
+    print("-"*60)
+    print(f"Fidelity  F = |Tr(U†U_meas)|²/4  = {fidelity_final:.4f}   (ideal = 1.0)")
+    print(f"Transmission T = ‖U‖²_F / 2      = {transmission_final:.4f}  (lossless = 1.0)")
+    print(f"Unitarity residual ‖U†U − I‖_F   = {unitarity_residual:.4f}  (ideal = 0.0)")
+    print("="*60)
 
 
 # In[ ]:
@@ -969,19 +1250,20 @@ states = {
     "Lcirc" : np.array([1.0, -1j],          dtype=complex) / np.sqrt(2),
 }
 
-print(f"{'state':<8}  {'F_state':>8}  |ψ_meas|    |ψ_target|")
-print("-" * 50)
-for name, psi_in in states.items():
-    psi_out_target = U_target @ psi_in
-    psi_out_meas   = U_final  @ psi_in
-    F = float(
-        abs(np.vdot(psi_out_target, psi_out_meas))**2 /
-        (np.vdot(psi_out_target, psi_out_target).real
-         * np.vdot(psi_out_meas,  psi_out_meas ).real + 1e-30)
-    )
-    print(f"{name:<8}  {F:>8.4f}  "
-          f"[{abs(psi_out_meas[0]):.3f}, {abs(psi_out_meas[1]):.3f}]  "
-          f"[{abs(psi_out_target[0]):.3f}, {abs(psi_out_target[1]):.3f}]")
+if mp.am_master():
+    print(f"{'state':<8}  {'F_state':>8}  |ψ_meas|    |ψ_target|")
+    print("-" * 50)
+    for name, psi_in in states.items():
+        psi_out_target = U_target @ psi_in
+        psi_out_meas   = U_final  @ psi_in
+        F = float(
+            abs(np.vdot(psi_out_target, psi_out_meas))**2 /
+            (np.vdot(psi_out_target, psi_out_target).real
+            * np.vdot(psi_out_meas,  psi_out_meas ).real + 1e-30)
+        )
+        print(f"{name:<8}  {F:>8.4f}  "
+            f"[{abs(psi_out_meas[0]):.3f}, {abs(psi_out_meas[1]):.3f}]  "
+            f"[{abs(psi_out_target[0]):.3f}, {abs(psi_out_target[1]):.3f}]")
 
 
 # In[ ]:
@@ -995,13 +1277,14 @@ for name, psi_in in states.items():
 U_cascade   = rotator(-np.pi/4) @ retarder(np.pi) @ rotator(np.pi/4)
 phase_match = float(abs(np.trace(U_target.conj().T @ U_cascade))**2 / 4.0)
 
-print("Analytical cascade  U = R(-π/4) D(π) R(π/4) =")
-print(np.round(U_cascade, 4))
-print()
-print(f"|Tr(U_target† U_cascade)|²/4 = {phase_match:.6f}  (1.0 = same up to global phase)")
-print()
-print("The inverse-designed device, the R-D-R cascade, and the Hadamard target")
-print("all implement the same operation up to an irrelevant global phase.")
+if mp.am_master():
+    print("Analytical cascade  U = R(-π/4) D(π) R(π/4) =")
+    print(np.round(U_cascade, 4))
+    print()
+    print(f"|Tr(U_target† U_cascade)|²/4 = {phase_match:.6f}  (1.0 = same up to global phase)")
+    print()
+    print("The inverse-designed device, the R-D-R cascade, and the Hadamard target")
+    print("all implement the same operation up to an irrelevant global phase.")
 
 
 # In[ ]:
@@ -1021,18 +1304,24 @@ ax.set_title("Final binarised design  (black = Si, white = air)")
 ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)")
 
 if mp.am_master():
-    plt.show()
+    plt.savefig(f"{RUN_DIR}/final_design.png", dpi=200)
+    plt.close()
 
-print("="*60)
-print("Final summary")
-print("="*60)
-print(f"Target unitary      : Hadamard")
-print(f"Wavelength          : {wl} µm")
-print(f"Design region       : {dr_lx} µm × {dr_ly} µm,  {Nx}×{Ny} pixels")
-print(f"Optimisation iters  : {len(history['J'])}")
-print(f"Final J             : {history['J'][-1]:.4f}")
-print(f"Final Fidelity F    : {history['Fh'][-1]:.4f}  (perfect = 1.0)")
-print(f"Verification F      : {fidelity_final:.4f}  (perfect = 1.0)")
-print(f"Verification Tavg   : {transmission_final:.4f}  (lossless = 1.0)")
-print(f"Unitarity residual  : {unitarity_residual:.4f}  (ideal = 0.0)")
-print(f"Design CSV          : {final_design_csv}")
+    print("="*60)
+    print("Final summary")
+    print("="*60)
+    print(f"Runtime             : {datetime.now() - START_TIME}")
+    print(f"Target unitary      : Hadamard")
+    print(f"Wavelength          : {wl} µm")
+    print(f"Design region       : {dr_lx} µm × {dr_ly} µm,  {Nx}×{Ny} pixels")
+    print(f"Global resolution   : {global_res}")
+    print(f"Beta range          : {beta_min} to {beta_max} with ramp {beta_ramp_start}")
+    print(f"Pen, Unitary weights: {lambda_pen_max}, {unitary_pen_max}")
+    print(f"Optimisation iters  : {len(history['J'])}")
+    print(f"Final J             : {history['J'][-1]:.4f}")
+    print(f"Final Fidelity F    : {history['Fh'][-1]:.4f}  (perfect = 1.0)")
+    print(f"Verification F      : {fidelity_final:.4f}  (perfect = 1.0)")
+    print(f"Verification Tavg   : {transmission_final:.4f}  (lossless = 1.0)")
+    print(f"Unitarity residual  : {unitarity_residual:.4f}  (ideal = 0.0)")
+    print(f"Design CSV          : {final_design_csv}")
+
