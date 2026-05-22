@@ -35,7 +35,7 @@ import meep as mp
 import meep.adjoint as mpa
 
 warnings.filterwarnings("ignore")
-mp.verbosity(1)   # set to 1 for full FDTD diagnostics
+mp.verbosity(0)   # set to 1 for full FDTD diagnostics
 
 print(f"MEEP  version : {mp.__version__}")
 print(f"NumPy version : {np.__version__}")
@@ -72,8 +72,8 @@ dr_ly = 2.5          # design region width in y (µm)
 
 
 # ===== RUN CONFIG =====
-RUN_NAME = "run1_stage1"      # change this for each run
-RESTART_FROM = None           # e.g. "misc/runs/run1_stage1/final_params.npy"
+RUN_NAME = "run1_stage1b"      # change this for each run
+RESTART_FROM = "misc/runs/run1_stage1/final_params.npy"  # e.g. "misc/runs/run1_stage1/final_params.npy"
 
 RUN_DIR = f"misc/runs/{RUN_NAME}"
 os.makedirs(RUN_DIR, exist_ok=True)
@@ -86,11 +86,12 @@ final_design_csv = f"{RUN_DIR}/final_design.csv"
 global_res = 16      # stage1: 16, stage2: 20, stage3: 25, polish: 30
 dr_res = global_res
 
-opt_steps = 15       # stage1: 15, stage2: 25, stage3: 30, polish: 10
+opt_steps = 100       # stage1: 15, stage2: 25, stage3: 30, polish: 10
 lambda_pen_max = 0.05 # stage1: 0.05, stage2: 0.15, stage3: 0.3, polish: 0.5
+unitary_pen_max = 0.05  # stage1: 0.05–0.1, stage2: 0.2, final: 0.5
 
 beta_min = 1.0
-beta_max = 12.0      # stage1: 12, stage2: 24, stage3: 48, polish: 64
+beta_max = 16.0      # stage1: 12, stage2: 24, stage3: 48, polish: 64
 beta_ramp_start = int(opt_steps * 0.2)
 
 df = 0.05 * fcen     # stage1: 0.05, stage2: 0.035, stage3: 0.025, polish: 0.02
@@ -697,7 +698,7 @@ except FileNotFoundError:
 # We apply this per-column scale before summing and chain-ruling through
 # the preprocessing pipeline.
 
-def evaluate_and_grad(params_flat, beta, lambda_pen_val, step_num=None):
+def evaluate_and_grad(params_flat, beta, lambda_pen_val, unitary_pen_val, step_num=None):
     """
     Run two FDTD sims (TE input, TM input) and return (J, grad, info_dict).
 
@@ -748,11 +749,12 @@ def evaluate_and_grad(params_flat, beta, lambda_pen_val, step_num=None):
     Tavg = float(np.linalg.norm(U_meas, 'fro')**2 / 2.0)
     Uerr = float(np.linalg.norm(U_meas.conj().T @ U_meas - np.eye(2), 'fro'))
 
-    # ── 6. Fabrication penalty ───────────────────────────────────────────────
+    # ── 6. Fabrication and Unitary penalty ───────────────────────────────────────────────
+    unitary_pen = Uerr**2
     pen = fab_penalty(params_flat, beta)
 
     # ── 7. Combined objective ────────────────────────────────────────────────
-    J = fidelity - lambda_pen_val * pen
+    J = fidelity - lambda_pen_val * pen - unitary_pen_val * unitary_pen
 
     # ── 8. Gradient ──────────────────────────────────────────────────────────
     # Raw adjoint gradient for each column is d(J_col_raw)/d(rho).
@@ -808,11 +810,13 @@ def nlopt_callback(x, grad):
 
     # Lambda schedule: ramp fabrication penalty weight from 0 to lambda_pen_max
     current_lambda_pen = lambda_pen_max * min(i / max(1, opt_steps - 1), 1.0)
+    current_un_pen     = unitary_pen_max * min(i / max(1, opt_steps - 1), 1.0)
 
     J_val, grad_val, info = evaluate_and_grad(
         params_flat    = x,
         beta           = current_beta,
         lambda_pen_val = current_lambda_pen,
+        unitary_pen_val = current_un_pen,
         step_num       = i + 1,
     )
 
